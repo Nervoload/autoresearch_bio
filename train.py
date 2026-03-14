@@ -26,6 +26,7 @@ from ar_runtime import (
     checkpoint_path,
     final_checkpoint_path,
     get_thermal_state,
+    host_telemetry_snapshot,
     latest_checkpoint_path,
     load_profile,
     memory_bytes_to_mb,
@@ -836,6 +837,24 @@ def telemetry_snapshot(device_type: str, peak_memory_bytes: int) -> tuple[dict[s
     return memory, peak_memory_bytes
 
 
+def update_host_telemetry(
+    pid: int,
+    process_cpu_percent: float | None,
+    peak_process_rss_mb: float,
+    peak_system_memory_used_mb: float,
+) -> tuple[dict[str, Any], float, float]:
+    host = host_telemetry_snapshot(pid)
+    if process_cpu_percent is not None:
+        host["process_cpu_percent"] = round(process_cpu_percent, 1)
+    rss_mb = float(host.get("process_rss_mb") or 0.0)
+    used_mb = float(host.get("memory_used_mb") or 0.0)
+    peak_process_rss_mb = max(peak_process_rss_mb, rss_mb)
+    peak_system_memory_used_mb = max(peak_system_memory_used_mb, used_mb)
+    host["peak_process_rss_mb"] = round(peak_process_rss_mb, 1)
+    host["peak_system_memory_used_mb"] = round(peak_system_memory_used_mb, 1)
+    return host, peak_process_rss_mb, peak_system_memory_used_mb
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run an autoresearch training experiment")
     parser.add_argument("--profile", default="climbmix_legacy")
@@ -983,6 +1002,14 @@ def main() -> int:
     last_checkpoint_save = time.time()
     started_at = time.time()
     time_budget = int(profile["time_budget_s"])
+    last_process_cpu_time = time.process_time()
+    process_cpu_percent = None
+    host, peak_process_rss_mb, peak_system_memory_used_mb = update_host_telemetry(
+        os.getpid(),
+        process_cpu_percent=None,
+        peak_process_rss_mb=0.0,
+        peak_system_memory_used_mb=0.0,
+    )
 
     print(f"Run dir: {run_dir}")
     print(f"Profile: {profile['profile_id']} ({profile['mode']})")
@@ -1003,6 +1030,7 @@ def main() -> int:
             "train_seconds": total_training_time,
             "tok_per_sec": latest_tok_per_sec,
             "memory": {},
+            "host": host,
             "thermal_state": thermal_state,
             "last_checkpoint": last_checkpoint,
             "last_error": None,
@@ -1061,6 +1089,11 @@ def main() -> int:
 
         sync_device(device_type)
         dt = time.time() - t0
+        process_cpu_time = time.process_time()
+        if dt > 0:
+            process_cpu_percent = 100.0 * (process_cpu_time - last_process_cpu_time) / dt
+            host["process_cpu_percent"] = round(process_cpu_percent, 1)
+        last_process_cpu_time = process_cpu_time
         if step > 10:
             total_training_time += dt
 
@@ -1079,15 +1112,24 @@ def main() -> int:
         memory, peak_memory_bytes = telemetry_snapshot(device_type, peak_memory_bytes)
         thermal_state = get_thermal_state()
         memory_fragment = ""
+        host_fragment = ""
         if memory.get("current_allocated_mb") is not None:
             memory_fragment = (
                 f" | memory: {memory['current_allocated_mb']:.1f}MB"
                 f"/{memory.get('recommended_max_mb') or 0:.1f}MB"
             )
+        if host.get("process_cpu_percent") is not None:
+            host_fragment += f" | cpu: {host['process_cpu_percent']:.1f}%"
+        if host.get("process_rss_mb") is not None:
+            host_fragment += f" | rss: {host['process_rss_mb']:.0f}MB"
+        if host.get("memory_used_mb") is not None and host.get("memory_total_mb") is not None:
+            host_fragment += f" | sysmem: {host['memory_used_mb']:.0f}/{host['memory_total_mb']:.0f}MB"
+        if host.get("load_1m") is not None:
+            host_fragment += f" | load1: {host['load_1m']:.2f}"
         print(
             f"\rstep {step:05d} ({100 * progress:.1f}%) | loss: {debiased_smooth_loss:.6f}"
             f" | lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {latest_tok_per_sec:,}"
-            f"{perf_fragment}{memory_fragment} | thermal: {thermal_state}"
+            f"{perf_fragment}{memory_fragment}{host_fragment} | thermal: {thermal_state}"
             f" | epoch: {epoch} | remaining: {remaining:.0f}s    ",
             end="",
             flush=True,
@@ -1103,6 +1145,12 @@ def main() -> int:
         now = time.time()
         if now - last_telemetry_check >= 5:
             last_telemetry_check = now
+            host, peak_process_rss_mb, peak_system_memory_used_mb = update_host_telemetry(
+                os.getpid(),
+                process_cpu_percent=process_cpu_percent,
+                peak_process_rss_mb=peak_process_rss_mb,
+                peak_system_memory_used_mb=peak_system_memory_used_mb,
+            )
             if device_type == "mps":
                 cap = (mps_memory_snapshot().get("recommended_max") or 0) * float(
                     profile["mps"]["memory_fraction"]
@@ -1184,6 +1232,7 @@ def main() -> int:
                     "train_seconds": round(total_training_time, 2),
                     "tok_per_sec": latest_tok_per_sec,
                     "memory": memory,
+                    "host": host,
                     "thermal_state": thermal_state,
                     "last_checkpoint": last_checkpoint,
                     "last_error": last_error,
@@ -1223,6 +1272,13 @@ def main() -> int:
     if device_type == "cuda":
         peak_memory_bytes = max(peak_memory_bytes, int(torch.cuda.max_memory_allocated()))
 
+    host, peak_process_rss_mb, peak_system_memory_used_mb = update_host_telemetry(
+        os.getpid(),
+        process_cpu_percent=process_cpu_percent,
+        peak_process_rss_mb=peak_process_rss_mb,
+        peak_system_memory_used_mb=peak_system_memory_used_mb,
+    )
+
     metrics = {
         "run_id": run_dir.name,
         "profile_id": profile["profile_id"],
@@ -1238,6 +1294,10 @@ def main() -> int:
         "num_params_M": round(num_params / 1e6, 1),
         "depth": config.n_layer,
         "thermal_state": thermal_state,
+        "load_1m": host.get("load_1m"),
+        "peak_process_rss_mb": round(peak_process_rss_mb, 1),
+        "peak_system_memory_used_mb": round(peak_system_memory_used_mb, 1),
+        "host": host,
         "warnings": warnings,
         "thermal_events": thermal_events,
         "last_checkpoint": last_checkpoint,
@@ -1278,6 +1338,7 @@ def main() -> int:
             "train_seconds": round(total_training_time, 2),
             "tok_per_sec": latest_tok_per_sec,
             "memory": telemetry_snapshot(device_type, peak_memory_bytes)[0],
+            "host": host,
             "thermal_state": thermal_state,
             "last_checkpoint": last_checkpoint,
             "last_error": last_error,

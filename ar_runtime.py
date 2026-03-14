@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -237,6 +238,120 @@ def memory_bytes_to_mb(value: float | int | None) -> float | None:
     return float(value) / 1024.0 / 1024.0
 
 
+def _run_command(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _parse_darwin_vm_stat(raw: str) -> dict[str, float | None]:
+    page_size_match = re.search(r"page size of (\d+) bytes", raw)
+    if not page_size_match:
+        return {}
+    page_size = int(page_size_match.group(1))
+    pages: dict[str, int] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        cleaned = value.strip().rstrip(".").replace(".", "").replace(",", "")
+        if not cleaned.isdigit():
+            continue
+        pages[key.strip()] = int(cleaned)
+    free_pages = pages.get("Pages free", 0) + pages.get("Pages speculative", 0)
+    used_pages = (
+        pages.get("Pages active", 0)
+        + pages.get("Pages inactive", 0)
+        + pages.get("Pages wired down", 0)
+        + pages.get("Pages occupied by compressor", 0)
+    )
+    return {
+        "memory_free_mb": memory_bytes_to_mb(free_pages * page_size),
+        "memory_used_mb": memory_bytes_to_mb(used_pages * page_size),
+    }
+
+
+def host_telemetry_snapshot(pid: int | None = None) -> dict[str, Any]:
+    telemetry: dict[str, Any] = {
+        "load_1m": None,
+        "load_5m": None,
+        "load_15m": None,
+        "process_rss_mb": None,
+        "process_vsz_mb": None,
+        "memory_total_mb": None,
+        "memory_used_mb": None,
+        "memory_free_mb": None,
+        "memory_available_mb": None,
+        "swap_used_mb": None,
+    }
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+        telemetry["load_1m"] = round(load_1m, 2)
+        telemetry["load_5m"] = round(load_5m, 2)
+        telemetry["load_15m"] = round(load_15m, 2)
+    except (AttributeError, OSError):
+        pass
+
+    target_pid = pid or os.getpid()
+    ps_out = _run_command("ps", "-o", "rss=,vsz=", "-p", str(target_pid))
+    if ps_out:
+        parts = ps_out.split()
+        if len(parts) >= 2 and all(part.isdigit() for part in parts[:2]):
+            telemetry["process_rss_mb"] = round(int(parts[0]) / 1024.0, 1)
+            telemetry["process_vsz_mb"] = round(int(parts[1]) / 1024.0, 1)
+
+    total_mb = None
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+        total_mb = memory_bytes_to_mb(page_size * phys_pages)
+        free_mb = memory_bytes_to_mb(page_size * avail_pages)
+        telemetry["memory_total_mb"] = round(total_mb, 1) if total_mb is not None else None
+        telemetry["memory_available_mb"] = round(free_mb, 1) if free_mb is not None else None
+        if total_mb is not None and free_mb is not None:
+            telemetry["memory_used_mb"] = round(total_mb - free_mb, 1)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    if sys.platform == "darwin":
+        sysctl_mem = _run_command("sysctl", "-n", "hw.memsize")
+        if sysctl_mem and sysctl_mem.isdigit():
+            total_mb = memory_bytes_to_mb(int(sysctl_mem))
+            telemetry["memory_total_mb"] = round(total_mb, 1) if total_mb is not None else None
+        vm_stat = _run_command("vm_stat")
+        if vm_stat:
+            parsed = _parse_darwin_vm_stat(vm_stat)
+            for key, value in parsed.items():
+                telemetry[key] = round(value, 1) if value is not None else None
+            if telemetry["memory_total_mb"] is not None and telemetry["memory_free_mb"] is not None:
+                telemetry["memory_available_mb"] = telemetry["memory_free_mb"]
+            if telemetry["memory_total_mb"] is not None and telemetry["memory_used_mb"] is not None:
+                telemetry["memory_used_mb"] = min(
+                    telemetry["memory_used_mb"],
+                    telemetry["memory_total_mb"],
+                )
+        swap_out = _run_command("sysctl", "-n", "vm.swapusage")
+        if swap_out:
+            match = re.search(r"used = ([0-9.]+)([MG])", swap_out)
+            if match:
+                value = float(match.group(1))
+                if match.group(2) == "G":
+                    value *= 1024.0
+                telemetry["swap_used_mb"] = round(value, 1)
+    return telemetry
+
+
 def get_thermal_state() -> str:
     override = os.environ.get("AR_THERMAL_STATE_OVERRIDE")
     if override:
@@ -322,6 +437,7 @@ def system_info(profile: dict[str, Any] | None = None) -> dict[str, Any]:
         "python": sys.version,
         "machine": platform.machine(),
         "processor": platform.processor(),
+        "cpu_count": os.cpu_count(),
         "profile_id": profile.get("profile_id") if profile else None,
         "dataset_id": profile.get("dataset_id") if profile else None,
         "tokenizer_id": profile.get("tokenizer_id") if profile else None,
@@ -329,6 +445,7 @@ def system_info(profile: dict[str, Any] | None = None) -> dict[str, Any]:
         "thermal_state": get_thermal_state(),
         "collected_at": utcnow(),
     }
+    info["host"] = host_telemetry_snapshot()
     if info["device_type"] == "mps":
         info["mps"] = mps_memory_snapshot()
     return info
@@ -350,6 +467,12 @@ def summary_text(metrics: dict[str, Any]) -> str:
         f"num_params_M:      {metrics.get('num_params_M', 'n/a')}",
         f"thermal_state:     {metrics.get('thermal_state', 'n/a')}",
     ]
+    if metrics.get("peak_process_rss_mb") is not None:
+        lines.append(f"peak_process_rss_mb: {metrics['peak_process_rss_mb']}")
+    if metrics.get("peak_system_memory_used_mb") is not None:
+        lines.append(f"peak_system_mem_mb: {metrics['peak_system_memory_used_mb']}")
+    if metrics.get("load_1m") is not None:
+        lines.append(f"load_1m:           {metrics['load_1m']}")
     if metrics.get("mfu_percent") is not None:
         lines.append(f"mfu_percent:       {metrics['mfu_percent']}")
     return "\n".join(lines) + "\n"
@@ -430,6 +553,11 @@ def render_status(status: dict[str, Any]) -> str:
     if memory:
         for key, value in memory.items():
             lines.append(f"memory.{key}: {value}")
+    host = status.get("host") or {}
+    if host:
+        for key, value in host.items():
+            if value is not None:
+                lines.append(f"host.{key}: {value}")
     return "\n".join(lines) + "\n"
 
 

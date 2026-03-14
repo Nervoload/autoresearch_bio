@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -169,9 +170,21 @@ def sample_command(selector: str) -> int:
 def logs_command(follow: bool, service_only: bool) -> int:
     status = read_json(service_status_path(), {})
     log_path = None
-    if not service_only and status.get("train_log"):
+    if follow and not service_only:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            status = read_json(service_status_path(), {})
+            if status.get("train_log"):
+                candidate = Path(status["train_log"])
+                if candidate.exists():
+                    log_path = candidate
+                    break
+            time.sleep(1)
+    elif not service_only and status.get("train_log"):
         log_path = Path(status["train_log"])
     if log_path is None or not log_path.exists():
+        if follow and not service_only:
+            print("Training log is not ready yet; following worker service log instead.", file=sys.stderr)
         log_path = service_log_path()
     if not log_path.exists():
         print(f"No log file found at {log_path}", file=sys.stderr)

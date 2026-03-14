@@ -11,6 +11,7 @@ from ar_runtime import (
     prune_checkpoints,
     render_status,
     run_checkpoints_dir,
+    system_info,
     summary_text,
 )
 
@@ -39,10 +40,17 @@ class RuntimeTests(unittest.TestCase):
                 "run_id": "demo",
                 "profile_id": "tinystories_8gb_search",
                 "memory": {"current_allocated_mb": 100.0},
+                "host": {"process_rss_mb": 512.0, "load_1m": 1.25},
             }
         )
         self.assertIn("state: running", rendered)
         self.assertIn("memory.current_allocated_mb: 100.0", rendered)
+        self.assertIn("host.process_rss_mb: 512.0", rendered)
+
+    def test_system_info_includes_host(self):
+        info = system_info(load_profile("tinystories_8gb_search"))
+        self.assertIn("host", info)
+        self.assertIn("device_type", info)
 
     def test_summary_text(self):
         summary = summary_text(

@@ -120,6 +120,22 @@ fi
 
 install_uv_if_needed
 
+wait_for_run_start() {
+  local attempts=30
+  local i
+  for ((i=1; i<=attempts; i++)); do
+    local status
+    status="$(bin/ar-local status 2>/dev/null || true)"
+    if [[ "$status" == *"train_log:"* ]] || [[ "$status" == *"state: running"* ]] || [[ "$status" == *"state: stalled"* ]]; then
+      echo "$status"
+      return 0
+    fi
+    sleep 1
+  done
+  bin/ar-local status || true
+  return 1
+}
+
 echo "Syncing project dependencies..."
 uv sync
 
@@ -146,6 +162,8 @@ echo "  bin/ar-local sample latest"
 
 if [[ "$FOLLOW_LOGS" -eq 1 && "$DO_START" -eq 1 ]]; then
   echo
+  echo "Waiting for the worker to start the run..."
+  wait_for_run_start || echo "Run has not reported a train log yet."
   echo "Following training logs..."
   exec bin/ar-local logs --follow
 fi
