@@ -65,10 +65,12 @@ If you are cloning this repo directly onto the Apple-silicon Mac that will do th
 ```bash
 git clone <your-repo-url> ~/autoresearch-macos
 cd ~/autoresearch-macos
-bin/bootstrap-training-mac --follow
+bin/bootstrap-training-mac --caffeinate --follow
 ```
 
 The bootstrap helper installs `uv` if needed, syncs dependencies, installs the local `launchd` worker, prepares the default TinyStories profile, starts the first `search` run, and optionally tails logs.
+
+`caffeinate` is a macOS utility that keeps the Mac awake while the command is running. It is recommended for laptop training runs so sleep does not interrupt setup, logging, or the first experiment.
 
 Manual equivalent:
 

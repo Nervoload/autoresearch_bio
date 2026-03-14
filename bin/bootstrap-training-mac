@@ -4,16 +4,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+ORIGINAL_ARGS=("$@")
 PROFILE="tinystories_8gb_search"
 MODE="search"
 DO_START=1
 DO_PREPARE=1
 FOLLOW_LOGS=0
+USE_CAFFEINATE=0
+
+if [[ "${AR_BOOTSTRAP_CAFFEINATED:-0}" != "1" ]]; then
+  if [[ "${1:-}" == "--caffeinate" ]]; then
+    shift
+    export AR_BOOTSTRAP_CAFFEINATED=1
+    exec caffeinate -dimsu "$0" "$@"
+  fi
+fi
 
 usage() {
   cat <<'EOF'
 Usage:
-  bin/bootstrap-training-mac [--profile <profile_id>] [--mode <search|soak>] [--no-start] [--skip-prepare] [--follow]
+  bin/bootstrap-training-mac [--caffeinate] [--profile <profile_id>] [--mode <search|soak>] [--no-start] [--skip-prepare] [--follow]
 
 Defaults:
   profile: tinystories_8gb_search
@@ -21,6 +31,7 @@ Defaults:
 
 Examples:
   bin/bootstrap-training-mac
+  bin/bootstrap-training-mac --caffeinate --follow
   bin/bootstrap-training-mac --profile tinystories_8gb_soak --mode soak
   bin/bootstrap-training-mac --no-start
 EOF
@@ -68,6 +79,10 @@ while [[ $# -gt 0 ]]; do
       FOLLOW_LOGS=1
       shift
       ;;
+    --caffeinate)
+      USE_CAFFEINATE=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -96,6 +111,11 @@ fi
 
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "Warning: this machine is not reporting arm64. Apple-silicon MPS behavior may not match the default profile." >&2
+fi
+
+if [[ "$USE_CAFFEINATE" -eq 1 ]]; then
+  export AR_BOOTSTRAP_CAFFEINATED=1
+  exec caffeinate -dimsu "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 install_uv_if_needed
