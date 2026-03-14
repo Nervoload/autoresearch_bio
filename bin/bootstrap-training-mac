@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+PROFILE="tinystories_8gb_search"
+MODE="search"
+DO_START=1
+DO_PREPARE=1
+FOLLOW_LOGS=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bin/bootstrap-training-mac [--profile <profile_id>] [--mode <search|soak>] [--no-start] [--skip-prepare] [--follow]
+
+Defaults:
+  profile: tinystories_8gb_search
+  mode:    search
+
+Examples:
+  bin/bootstrap-training-mac
+  bin/bootstrap-training-mac --profile tinystories_8gb_soak --mode soak
+  bin/bootstrap-training-mac --no-start
+EOF
+}
+
+refresh_path() {
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+}
+
+install_uv_if_needed() {
+  refresh_path
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Installing uv into \$HOME/.local/bin..."
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  refresh_path
+
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "uv was installed but is still not on PATH. Open a new shell or export PATH manually." >&2
+    exit 1
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      PROFILE="${2:-}"
+      shift 2
+      ;;
+    --mode)
+      MODE="${2:-}"
+      shift 2
+      ;;
+    --no-start)
+      DO_START=0
+      shift
+      ;;
+    --skip-prepare)
+      DO_PREPARE=0
+      shift
+      ;;
+    --follow)
+      FOLLOW_LOGS=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$MODE" != "search" && "$MODE" != "soak" ]]; then
+  echo "--mode must be one of: search, soak" >&2
+  exit 1
+fi
+
+if [[ -z "$PROFILE" ]]; then
+  echo "--profile cannot be empty" >&2
+  exit 1
+fi
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "This bootstrap script is intended for macOS training machines." >&2
+fi
+
+if [[ "$(uname -m)" != "arm64" ]]; then
+  echo "Warning: this machine is not reporting arm64. Apple-silicon MPS behavior may not match the default profile." >&2
+fi
+
+install_uv_if_needed
+
+echo "Syncing project dependencies..."
+uv sync
+
+echo "Installing or refreshing the local launchd worker..."
+bin/ar-local bootstrap
+
+if [[ "$DO_PREPARE" -eq 1 ]]; then
+  echo "Preparing profile: $PROFILE"
+  bin/ar-local prepare --profile "$PROFILE"
+fi
+
+if [[ "$DO_START" -eq 1 ]]; then
+  echo "Starting first run: mode=$MODE profile=$PROFILE"
+  bin/ar-local start "$MODE" --profile "$PROFILE"
+fi
+
+echo
+echo "Bootstrap complete."
+echo "Useful commands:"
+echo "  bin/ar-local status"
+echo "  bin/ar-local logs --follow"
+echo "  bin/ar-local runs latest"
+echo "  bin/ar-local sample latest"
+
+if [[ "$FOLLOW_LOGS" -eq 1 && "$DO_START" -eq 1 ]]; then
+  echo
+  echo "Following training logs..."
+  exec bin/ar-local logs --follow
+fi

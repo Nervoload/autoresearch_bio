@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${AR_ENV_FILE:-$ROOT/.ar-remote.env}"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Missing remote env file: $ENV_FILE" >&2
+  echo "Copy .ar-remote.env.example to .ar-remote.env and fill in AR_REMOTE_HOST and AR_REMOTE_ROOT." >&2
+  exit 1
+fi
+
+set -a
+source "$ENV_FILE"
+set +a
+
+require_remote_env() {
+  : "${AR_REMOTE_HOST:?Set AR_REMOTE_HOST in $ENV_FILE}"
+  : "${AR_REMOTE_ROOT:?Set AR_REMOTE_ROOT in $ENV_FILE}"
+}
+
+remote_exec() {
+  require_remote_env
+  ssh "$AR_REMOTE_HOST" "export PATH=\"\$HOME/.local/bin:\$PATH\"; mkdir -p \"$AR_REMOTE_ROOT\"; cd \"$AR_REMOTE_ROOT\" && $1"
+}
+
+sync_repo() {
+  require_remote_env
+  ssh "$AR_REMOTE_HOST" "mkdir -p \"$AR_REMOTE_ROOT\""
+  rsync -az --delete \
+    --filter=':- .gitignore' \
+    --exclude '.git/' \
+    --exclude '.venv/' \
+    --exclude 'results/' \
+    "$ROOT/" "$AR_REMOTE_HOST:$AR_REMOTE_ROOT/"
+}
+
+source_metadata_b64() {
+  python3 - "$ROOT" <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def run(*args):
+    proc = subprocess.run(
+        args,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+commit = run("git", "rev-parse", "--short", "HEAD")
+branch = run("git", "rev-parse", "--abbrev-ref", "HEAD")
+status = run("git", "status", "--porcelain")
+dirty = bool(status)
+
+listing = subprocess.run(
+    ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    cwd=root,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=True,
+)
+paths = sorted(item.decode("utf-8") for item in listing.stdout.split(b"\0") if item)
+
+digest = hashlib.sha256()
+for rel in paths:
+    path = root / rel
+    if not path.is_file():
+        continue
+    digest.update(rel.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+
+payload = {
+    "git_commit": commit,
+    "git_branch": branch,
+    "dirty": dirty,
+    "source_hash": digest.hexdigest(),
+}
+print(base64.b64encode(json.dumps(payload, sort_keys=True).encode("utf-8")).decode("utf-8"))
+PY
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bin/ar bootstrap
+  bin/ar sync
+  bin/ar prepare --profile <profile_id>
+  bin/ar start <search|soak> --profile <profile_id>
+  bin/ar stop
+  bin/ar status
+  bin/ar logs [--follow] [--service]
+  bin/ar runs [list|show <run_id>|latest]
+  bin/ar sample latest
+EOF
+}
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  usage
+  exit 1
+fi
+shift
+
+case "$cmd" in
+  bootstrap)
+    sync_repo
+    remote_exec "uv sync"
+    remote_exec "uv run python ar_remote.py install-launchagent --repo-root \"$AR_REMOTE_ROOT\""
+    remote_exec "uv run python ar_remote.py status"
+    ;;
+
+  sync)
+    sync_repo
+    ;;
+
+  prepare)
+    profile=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --profile)
+          profile="$2"
+          shift 2
+          ;;
+        *)
+          echo "Unknown argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [[ -z "$profile" ]]; then
+      echo "prepare requires --profile" >&2
+      exit 1
+    fi
+    sync_repo
+    remote_exec "uv sync"
+    remote_exec "uv run prepare.py --profile \"$profile\""
+    ;;
+
+  start)
+    mode="${1:-}"
+    if [[ "$mode" != "search" && "$mode" != "soak" ]]; then
+      echo "start requires a mode: search or soak" >&2
+      exit 1
+    fi
+    shift
+    profile=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --profile)
+          profile="$2"
+          shift 2
+          ;;
+        *)
+          echo "Unknown argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [[ -z "$profile" ]]; then
+      echo "start requires --profile" >&2
+      exit 1
+    fi
+    sync_repo
+    remote_exec "uv sync"
+    remote_exec "uv run python ar_remote.py install-launchagent --repo-root \"$AR_REMOTE_ROOT\" --quiet"
+    source_b64="$(source_metadata_b64)"
+    remote_exec "uv run python ar_remote.py enqueue-start --profile \"$profile\" --mode \"$mode\" --source-json-base64 \"$source_b64\""
+    remote_exec "uv run python ar_remote.py status"
+    ;;
+
+  stop)
+    remote_exec "uv run python ar_remote.py enqueue-stop"
+    remote_exec "uv run python ar_remote.py status"
+    ;;
+
+  status)
+    remote_exec "uv run python ar_remote.py status"
+    ;;
+
+  logs)
+    follow=""
+    service=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --follow)
+          follow="--follow"
+          shift
+          ;;
+        --service)
+          service="--service"
+          shift
+          ;;
+        *)
+          echo "Unknown argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    remote_exec "uv run python ar_remote.py logs $follow $service"
+    ;;
+
+  runs)
+    selector="${1:-list}"
+    case "$selector" in
+      list)
+        remote_exec "uv run python ar_remote.py runs list"
+        ;;
+      latest)
+        remote_exec "uv run python ar_remote.py runs latest"
+        ;;
+      show)
+        run_id="${2:-}"
+        if [[ -z "$run_id" ]]; then
+          echo "runs show requires a run_id" >&2
+          exit 1
+        fi
+        remote_exec "uv run python ar_remote.py runs show \"$run_id\""
+        ;;
+      *)
+        echo "Unknown runs selector: $selector" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  sample)
+    selector="${1:-}"
+    if [[ "$selector" != "latest" ]]; then
+      echo "sample currently only supports: latest" >&2
+      exit 1
+    fi
+    remote_exec "uv run python ar_remote.py sample latest"
+    ;;
+
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac

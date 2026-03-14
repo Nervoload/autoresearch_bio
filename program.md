@@ -1,114 +1,79 @@
 # autoresearch
 
-This is an experiment to have the LLM do its own research.
+This repo now has a profile-aware runtime, artifact model, and remote control plane. Work with it as a small research machine, not as a one-off script.
 
-## Setup
+## Operating Model
 
-To set up a new experiment, work with the user to:
+- `prepare.py` handles dataset and tokenizer prep for a chosen profile.
+- `train.py` runs one concrete experiment and writes artifacts into `results/runs/<run_id>/`.
+- `bin/ar` is the preferred interface when operating a remote Apple-silicon worker over SSH.
+- `bin/ar-local` is the preferred interface when you are already on the training Mac over SSH or running Codex there directly.
+- `profiles/*.json` are now part of the research surface. They control dataset, tokenizer, model shape, optimizer settings, and MPS guardrails.
+- The "autoresearch" loop lives in the external agent. This repo executes experiments and records evidence; the agent decides what to change next.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+## Default Workflow
 
-Once you get confirmation, kick off the experimentation.
+For a remote Mac:
 
-## Experimentation
+1. `bin/ar bootstrap`
+2. `bin/ar prepare --profile tinystories_8gb_search`
+3. `bin/ar start search --profile tinystories_8gb_search`
+4. `bin/ar status`
+5. `bin/ar logs --follow`
+6. `bin/ar runs latest`
+7. `bin/ar sample latest`
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+For local manual testing:
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+1. `uv sync`
+2. `uv run prepare.py --profile tinystories_8gb_search`
+3. `uv run train.py --profile tinystories_8gb_search`
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+For direct operation on the training Mac over SSH:
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+1. `bin/ar-local bootstrap`
+2. `bin/ar-local prepare --profile tinystories_8gb_search`
+3. `bin/ar-local start search --profile tinystories_8gb_search`
+4. `bin/ar-local status`
+5. `bin/ar-local logs --follow`
+6. `bin/ar-local runs latest`
+7. `bin/ar-local sample latest`
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+If you are bringing up a freshly cloned training Mac, use this exact order:
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+1. `uv sync`
+2. `bin/ar-local bootstrap`
+3. `bin/ar-local prepare --profile tinystories_8gb_search`
+4. `bin/ar-local start search --profile tinystories_8gb_search`
+5. `bin/ar-local logs --follow`
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+## Research Rules
 
-## Output format
+What you can change:
 
-Once the script finishes it prints a summary like this:
+- `train.py`
+- `profiles/*.json`
+- remote control scripts and observability code
+- documentation and analysis helpers
 
-```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
-```
+What should stay fixed unless the human explicitly asks otherwise:
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+- the `val_bpb` evaluator semantics for a given profile
+- the dataset and tokenizer identity inside a profile while comparing architecture changes
+- the artifact contract under `results/runs/<run_id>/`
+- the MPS memory and thermal safety policy
 
-```
-grep "^val_bpb:" run.log
-```
+## Acceptance Criteria For A Good Experiment
 
-## Logging results
+- It finishes without crashing or makes a deliberate guarded stop.
+- It writes `manifest.json`, `metrics.json`, `status.json`, `summary.txt`, a final sample, and checkpoint artifacts.
+- It records the profile id, source metadata, and final state.
+- On MPS, it reports tokens/sec and allocator telemetry instead of pretending to be an H100.
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+## Simplicity Bias
 
-The TSV has a header row and 5 columns:
+Keep the repo small. Prefer a good profile or a small runtime helper over framework creep. A clean improvement that preserves the remote workflow and artifact model is better than a large clever change that makes the worker brittle.
 
-```
-commit	val_bpb	memory_gb	status	description
-```
+## Codex Note
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
-
-## The experiment loop
-
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
-
-LOOP FOREVER:
-
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+If Codex is the external research agent, prefer `bin/ar-local` when Codex is running on the training Mac itself. Use `bin/ar` only when Codex is controlling a different machine remotely from another checkout.

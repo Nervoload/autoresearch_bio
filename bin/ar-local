@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+source_metadata_b64() {
+  python3 - "$ROOT" <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+def run(*args):
+    proc = subprocess.run(
+        args,
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+commit = run("git", "rev-parse", "--short", "HEAD")
+branch = run("git", "rev-parse", "--abbrev-ref", "HEAD")
+status = run("git", "status", "--porcelain")
+dirty = bool(status)
+
+listing = subprocess.run(
+    ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    cwd=root,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=True,
+)
+paths = sorted(item.decode("utf-8") for item in listing.stdout.split(b"\0") if item)
+
+digest = hashlib.sha256()
+for rel in paths:
+    path = root / rel
+    if not path.is_file():
+        continue
+    digest.update(rel.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+
+payload = {
+    "git_commit": commit,
+    "git_branch": branch,
+    "dirty": dirty,
+    "source_hash": digest.hexdigest(),
+}
+print(base64.b64encode(json.dumps(payload, sort_keys=True).encode("utf-8")).decode("utf-8"))
+PY
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bin/ar-local bootstrap
+  bin/ar-local prepare --profile <profile_id>
+  bin/ar-local start <search|soak> --profile <profile_id>
+  bin/ar-local stop
+  bin/ar-local status
+  bin/ar-local logs [--follow] [--service]
+  bin/ar-local runs [list|show <run_id>|latest]
+  bin/ar-local sample latest
+EOF
+}
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  usage
+  exit 1
+fi
+shift
+
+case "$cmd" in
+  bootstrap)
+    uv sync
+    uv run python ar_remote.py install-launchagent --repo-root "$ROOT"
+    uv run python ar_remote.py status
+    ;;
+
+  prepare)
+    profile=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --profile)
+          profile="$2"
+          shift 2
+          ;;
+        *)
+          echo "Unknown argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [[ -z "$profile" ]]; then
+      echo "prepare requires --profile" >&2
+      exit 1
+    fi
+    uv sync
+    uv run prepare.py --profile "$profile"
+    ;;
+
+  start)
+    mode="${1:-}"
+    if [[ "$mode" != "search" && "$mode" != "soak" ]]; then
+      echo "start requires a mode: search or soak" >&2
+      exit 1
+    fi
+    shift
+    profile=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --profile)
+          profile="$2"
+          shift 2
+          ;;
+        *)
+          echo "Unknown argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    if [[ -z "$profile" ]]; then
+      echo "start requires --profile" >&2
+      exit 1
+    fi
+    uv sync
+    uv run python ar_remote.py install-launchagent --repo-root "$ROOT" --quiet
+    source_b64="$(source_metadata_b64)"
+    uv run python ar_remote.py enqueue-start --profile "$profile" --mode "$mode" --source-json-base64 "$source_b64"
+    uv run python ar_remote.py status
+    ;;
+
+  stop)
+    uv run python ar_remote.py enqueue-stop
+    uv run python ar_remote.py status
+    ;;
+
+  status)
+    uv run python ar_remote.py status
+    ;;
+
+  logs)
+    follow=""
+    service=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --follow)
+          follow="--follow"
+          shift
+          ;;
+        --service)
+          service="--service"
+          shift
+          ;;
+        *)
+          echo "Unknown argument: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    uv run python ar_remote.py logs $follow $service
+    ;;
+
+  runs)
+    selector="${1:-list}"
+    case "$selector" in
+      list)
+        uv run python ar_remote.py runs list
+        ;;
+      latest)
+        uv run python ar_remote.py runs latest
+        ;;
+      show)
+        run_id="${2:-}"
+        if [[ -z "$run_id" ]]; then
+          echo "runs show requires a run_id" >&2
+          exit 1
+        fi
+        uv run python ar_remote.py runs show "$run_id"
+        ;;
+      *)
+        echo "Unknown runs selector: $selector" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+
+  sample)
+    selector="${1:-}"
+    if [[ "$selector" != "latest" ]]; then
+      echo "sample currently only supports: latest" >&2
+      exit 1
+    fi
+    uv run python ar_remote.py sample latest
+    ;;
+
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac

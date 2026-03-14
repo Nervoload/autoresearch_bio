@@ -1,404 +1,489 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Profile-aware data preparation and runtime utilities for autoresearch.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    uv run prepare.py --profile climbmix_legacy
+    uv run prepare.py --profile tinystories_8gb_search
 """
 
-import os
-import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+from __future__ import annotations
 
-import requests
+import argparse
+import math
+import os
+import pickle
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Iterator
+
 import pyarrow.parquet as pq
+import requests
 import rustbpe
 import tiktoken
 import torch
 
-def verify_macos_env():
-    import sys
-    if sys.platform != "darwin":
-        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon with a compatible PyTorch build.")
-    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
-    print()
+from ar_runtime import (
+    dataset_cache_dir,
+    detect_device_type,
+    ensure_dir,
+    load_profile,
+    read_json,
+    tokenizer_cache_dir,
+    write_json,
+)
 
-verify_macos_env()
 
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
-
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
+def download_file(url: str, filepath: Path, max_attempts: int = 5) -> bool:
+    if filepath.exists():
         return True
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
+    ensure_dir(filepath.parent)
+    temp_path = filepath.with_suffix(filepath.suffix + ".tmp")
     for attempt in range(1, max_attempts + 1):
         try:
             response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
+            with temp_path.open("wb") as handle:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
+                        handle.write(chunk)
+            os.replace(temp_path, filepath)
+            print(f"  downloaded {filepath.name}")
             return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+        except (OSError, requests.RequestException) as exc:
+            print(f"  attempt {attempt}/{max_attempts} failed for {filepath.name}: {exc}")
+            temp_path.unlink(missing_ok=True)
+            filepath.unlink(missing_ok=True)
             if attempt < max_attempts:
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+def resolve_hf_parquet_urls(dataset_cfg: dict[str, object]) -> list[str]:
+    dataset_id = str(dataset_cfg["hf_dataset"])
+    split_name = str(dataset_cfg.get("hf_split", "train"))
+    url = f"https://huggingface.co/api/datasets/{dataset_id}/parquet"
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    entries = []
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        if "parquet_files" in payload:
+            entries = payload["parquet_files"]
+        else:
+            config_name = dataset_cfg.get("hf_config")
+            if config_name is None:
+                if "default" in payload:
+                    config_name = "default"
+                elif len(payload) == 1:
+                    config_name = next(iter(payload))
+            selected = payload.get(config_name, {}) if config_name else {}
+            if isinstance(selected, dict) and split_name in selected:
+                entries = selected[split_name]
+            elif isinstance(selected, list):
+                entries = selected
+
+    urls = []
+    for entry in entries:
+        if isinstance(entry, str):
+            urls.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("split") and entry.get("split") != split_name:
+            continue
+        for key in ("url", "parquet_url", "download_url"):
+            if entry.get(key):
+                urls.append(entry[key])
+                break
+    if not urls:
+        raise RuntimeError(f"Could not resolve parquet URLs for dataset {dataset_id}")
+    return urls
+
+
+def climbmix_file_paths(profile: dict[str, object], num_shards: int | None) -> list[tuple[str, Path]]:
+    dataset_cfg = profile["dataset"]
+    data_dir = ensure_dir(dataset_cache_dir(profile) / "data")
+    base_url = str(dataset_cfg["base_url"])
+    max_train_shard = int(dataset_cfg["max_train_shard"])
+    val_shard = int(dataset_cfg["val_shard"])
+    default_num_shards = int(dataset_cfg.get("default_num_shards", 10))
+    requested = default_num_shards if num_shards is None else num_shards
+    num_train = min(requested, max_train_shard)
+    shard_ids = list(range(num_train))
+    if val_shard not in shard_ids:
+        shard_ids.append(val_shard)
+    paths: list[tuple[str, Path]] = []
+    for shard_id in shard_ids:
+        filename = f"shard_{shard_id:05d}.parquet"
+        paths.append((f"{base_url}/{filename}", data_dir / filename))
+    return paths
+
+
+def hf_parquet_file_paths(profile: dict[str, object]) -> list[tuple[str, Path]]:
+    dataset_cfg = profile["dataset"]
+    data_dir = ensure_dir(dataset_cache_dir(profile) / "data")
+    urls = resolve_hf_parquet_urls(dataset_cfg)
+    paths = []
+    for index, url in enumerate(urls):
+        filename = Path(url).name
+        if not filename.endswith(".parquet"):
+            filename = f"{dataset_cfg['hf_split']}-{index:05d}.parquet"
+        paths.append((url, data_dir / filename))
+    return paths
+
+
+def download_dataset(
+    profile: dict[str, object],
+    num_shards: int | None = None,
+    download_workers: int = 8,
+) -> None:
+    dataset_cfg = profile["dataset"]
+    kind = dataset_cfg["kind"]
+    if kind == "climbmix_shards":
+        file_pairs = climbmix_file_paths(profile, num_shards)
+    elif kind == "hf_parquet":
+        file_pairs = hf_parquet_file_paths(profile)
+    else:
+        raise ValueError(f"Unsupported dataset kind: {kind}")
+
+    existing = sum(1 for _, path in file_pairs if path.exists())
+    if existing == len(file_pairs):
+        print(f"Data: all {len(file_pairs)} files already downloaded")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    print(f"Data: downloading {len(file_pairs) - existing} file(s) ({existing} already cached)")
+    workers = max(1, min(download_workers, len(file_pairs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(download_file, url, path) for url, path in file_pairs]
+        failures = 0
+        for future in as_completed(futures):
+            if not future.result():
+                failures += 1
+    if failures:
+        raise RuntimeError(f"Failed to download {failures} dataset file(s)")
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+    metadata = {
+        "dataset_id": profile["dataset_id"],
+        "kind": kind,
+        "downloaded_at": time.time(),
+        "files": [str(path) for _, path in file_pairs],
+    }
+    write_json(dataset_cache_dir(profile) / "metadata.json", metadata)
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def list_parquet_files(profile: dict[str, object]) -> list[Path]:
+    data_dir = dataset_cache_dir(profile) / "data"
+    return sorted(path for path in data_dir.glob("*.parquet"))
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
+
+def iter_parquet_texts(path: Path, text_column: str) -> Iterator[str]:
+    parquet_file = pq.ParquetFile(path)
+    for row_group_idx in range(parquet_file.num_row_groups):
+        row_group = parquet_file.read_row_group(row_group_idx, columns=[text_column])
+        for text in row_group.column(text_column).to_pylist():
+            yield text
+
+
+def iter_ranged_parquet_texts(
+    paths: list[Path],
+    text_column: str,
+    start: int,
+    end: int | None,
+) -> Iterator[str]:
+    row_index = 0
+    for path in paths:
+        parquet_file = pq.ParquetFile(path)
+        for row_group_idx in range(parquet_file.num_row_groups):
+            row_group = parquet_file.read_row_group(row_group_idx, columns=[text_column])
+            texts = row_group.column(text_column).to_pylist()
+            next_row_index = row_index + len(texts)
+            if next_row_index <= start:
+                row_index = next_row_index
+                continue
+            if end is not None and row_index >= end:
+                return
+            batch_start = max(0, start - row_index)
+            batch_end = len(texts) if end is None else min(len(texts), end - row_index)
+            if batch_start < batch_end:
+                for text in texts[batch_start:batch_end]:
+                    yield text
+            row_index = next_row_index
+
+
+def iter_documents_once(profile: dict[str, object], split: str) -> Iterator[str]:
+    dataset_cfg = profile["dataset"]
+    text_column = str(dataset_cfg.get("text_column", "text"))
+    kind = dataset_cfg["kind"]
+    paths = list_parquet_files(profile)
+    if not paths:
+        raise RuntimeError("No parquet files found. Run prepare.py first.")
+
+    if kind == "climbmix_shards":
+        val_filename = f"shard_{int(dataset_cfg['val_shard']):05d}.parquet"
+        if split == "train":
+            target_paths = [path for path in paths if path.name != val_filename]
+        else:
+            target_paths = [path for path in paths if path.name == val_filename]
+        if not target_paths:
+            raise RuntimeError(f"No parquet files found for split={split}")
+        for path in target_paths:
+            yield from iter_parquet_texts(path, text_column)
         return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    if kind == "hf_parquet":
+        start, end = dataset_cfg[f"{split}_range"]
+        yield from iter_ranged_parquet_texts(paths, text_column, int(start), end)
+        return
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    raise ValueError(f"Unsupported dataset kind: {kind}")
 
-    # --- Train with rustbpe ---
+
+def text_iterator(profile: dict[str, object]) -> Iterator[str]:
+    tokenizer_cfg = profile["tokenizer"]
+    max_chars = int(tokenizer_cfg.get("train_max_chars", 1_000_000_000))
+    doc_cap = int(tokenizer_cfg.get("doc_cap", 10_000))
+    total_chars = 0
+    for text in iter_documents_once(profile, "train"):
+        doc = text[:doc_cap] if len(text) > doc_cap else text
+        total_chars += len(doc)
+        yield doc
+        if total_chars >= max_chars:
+            return
+
+
+def train_tokenizer(profile: dict[str, object]) -> None:
+    tokenizer_cfg = profile["tokenizer"]
+    target_dir = tokenizer_cache_dir(profile)
+    tokenizer_path = target_dir / "tokenizer.pkl"
+    token_bytes_path = target_dir / "token_bytes.pt"
+    if tokenizer_path.exists() and token_bytes_path.exists():
+        print(f"Tokenizer: already trained at {target_dir}")
+        return
+
+    ensure_dir(target_dir)
+    files = list_parquet_files(profile)
+    if len(files) < 1:
+        raise RuntimeError("Need dataset files before training tokenizer")
+
     print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
+    started = time.time()
     tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    special_tokens = list(tokenizer_cfg["special_tokens"])
+    vocab_size = int(tokenizer_cfg["vocab_size"]) - len(special_tokens)
+    tokenizer.train_from_iterator(
+        text_iterator(profile),
+        vocab_size,
+        pattern=str(tokenizer_cfg["split_pattern"]),
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    mergeable_ranks = {bytes(key): value for key, value in tokenizer.get_mergeable_ranks()}
+    token_offset = len(mergeable_ranks)
+    special_token_map = {
+        token: token_offset + index for index, token in enumerate(special_tokens)
+    }
+    encoding = tiktoken.Encoding(
+        name=profile["tokenizer_id"],
+        pat_str=tokenizer.get_pattern(),
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_token_map,
+    )
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    with tokenizer_path.open("wb") as handle:
+        pickle.dump(encoding, handle)
+    print(f"Tokenizer: trained in {time.time() - started:.1f}s")
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
+    token_bytes = []
+    special_set = set(special_tokens)
+    for token_id in range(encoding.n_vocab):
+        token_str = encoding.decode([token_id])
         if token_str in special_set:
-            token_bytes_list.append(0)
+            token_bytes.append(0)
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            token_bytes.append(len(token_str.encode("utf-8")))
+    torch.save(torch.tensor(token_bytes, dtype=torch.int32), token_bytes_path)
+    print(f"Tokenizer: saved to {target_dir}")
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
 
 class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
+    def __init__(self, enc: tiktoken.Encoding, bos_token: str) -> None:
         self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+        self.bos_token_id = enc.encode_single_token(bos_token)
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+    def from_profile(cls, profile: dict[str, object]) -> "Tokenizer":
+        target_dir = tokenizer_cache_dir(profile)
+        with (target_dir / "tokenizer.pkl").open("rb") as handle:
+            enc = pickle.load(handle)
+        bos_token = str(profile["tokenizer"]["bos_token"])
+        return cls(enc, bos_token)
 
-    def get_vocab_size(self):
+    def get_vocab_size(self) -> int:
         return self.enc.n_vocab
 
-    def get_bos_token_id(self):
+    def get_bos_token_id(self) -> int:
         return self.bos_token_id
 
-    def encode(self, text, prepend=None, num_threads=8):
+    def encode(self, text: str | list[str], prepend: int | None = None, num_threads: int = 8):
         if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+            prepend_id = prepend
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
             if prepend is not None:
                 ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+            return ids
+        if isinstance(text, list):
+            batches = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
             if prepend is not None:
-                for row in ids:
+                for row in batches:
                     row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
+            return batches
+        raise ValueError(f"Unsupported input type: {type(text)}")
 
-    def decode(self, ids):
+    def decode(self, ids: list[int]) -> str:
         return self.enc.decode(ids)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def get_token_bytes(profile: dict[str, object], device: str = "cpu") -> torch.Tensor:
+    path = tokenizer_cache_dir(profile) / "token_bytes.pt"
+    return torch.load(path, map_location=device)
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
+def document_batches(
+    profile: dict[str, object],
+    split: str,
+    tokenizer_batch_size: int = 128,
+) -> Iterator[tuple[list[str], int]]:
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        batch: list[str] = []
+        for text in iter_documents_once(profile, split):
+            batch.append(text)
+            if len(batch) >= tokenizer_batch_size:
+                yield batch, epoch
+                batch = []
+        if batch:
+            yield batch, epoch
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
+def make_dataloader(
+    profile: dict[str, object],
+    tokenizer: Tokenizer,
+    batch_size: int,
+    sequence_len: int,
+    split: str,
+    buffer_size: int = 1000,
+):
+    assert split in {"train", "val"}
+    row_capacity = sequence_len + 1
+    batches = document_batches(profile, split)
     bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
+    doc_buffer: list[list[int]] = []
     epoch = 1
 
-    def refill_buffer():
+    def refill_buffer() -> None:
         nonlocal epoch
         doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+        doc_buffer.extend(tokenizer.encode(doc_batch, prepend=bos_token))
 
-    # Detect device
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(device=="cuda"))
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    device = detect_device_type()
+    row_buffer = torch.empty((batch_size, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(
+        2 * batch_size * sequence_len,
+        dtype=torch.long,
+        pin_memory=(device == "cuda"),
+    )
+    device_buffer = torch.empty(2 * batch_size * sequence_len, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[: batch_size * sequence_len].view(batch_size, sequence_len)
+    cpu_targets = cpu_buffer[batch_size * sequence_len :].view(batch_size, sequence_len)
+    inputs = device_buffer[: batch_size * sequence_len].view(batch_size, sequence_len)
+    targets = device_buffer[batch_size * sequence_len :].view(batch_size, sequence_len)
 
     while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
+        for row_idx in range(batch_size):
+            position = 0
+            while position < row_capacity:
                 while len(doc_buffer) < buffer_size:
                     refill_buffer()
 
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
+                remaining = row_capacity - position
                 best_idx = -1
                 best_len = 0
-                for i, doc in enumerate(doc_buffer):
+                for index, doc in enumerate(doc_buffer):
                     doc_len = len(doc)
                     if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
+                        best_idx = index
                         best_len = doc_len
 
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
+                    row_buffer[row_idx, position : position + len(doc)] = torch.tensor(
+                        doc, dtype=torch.long
+                    )
+                    position += len(doc)
                 else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    shortest_idx = min(range(len(doc_buffer)), key=lambda index: len(doc_buffer[index]))
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+                    row_buffer[row_idx, position : position + remaining] = torch.tensor(
+                        doc[:remaining], dtype=torch.long
+                    )
+                    position += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        device_buffer.copy_(cpu_buffer, non_blocking=(device == "cuda"))
         yield inputs, targets, epoch
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
+def evaluate_bpb(
+    profile: dict[str, object],
+    model: torch.nn.Module,
+    tokenizer: Tokenizer,
+    batch_size: int,
+) -> float:
     device = next(model.parameters()).device
-    token_bytes = get_token_bytes(device=device)
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    token_bytes = get_token_bytes(profile, device=str(device))
+    loader = make_dataloader(profile, tokenizer, batch_size, int(profile["max_seq_len"]), "val")
+    steps = max(1, int(profile["eval_tokens"]) // (batch_size * int(profile["max_seq_len"])))
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
+        x, y, _ = next(loader)
+        loss_flat = model(x, y, reduction="none").view(-1)
         y_flat = y.view(-1)
         nbytes = token_bytes[y_flat]
         mask = nbytes > 0
         total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
+        total_bytes += int(nbytes.sum().item())
     return total_nats / (math.log(2) * total_bytes)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument("--profile", default="climbmix_legacy")
+    parser.add_argument("--num-shards", type=int, default=None)
+    parser.add_argument("--download-workers", type=int, default=8)
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
+    profile = load_profile(args.profile)
+    print(f"Preparing profile: {profile['profile_id']}")
+    print(f"Dataset cache: {dataset_cache_dir(profile)}")
+    print(f"Tokenizer cache: {tokenizer_cache_dir(profile)}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    download_dataset(profile, num_shards=args.num_shards, download_workers=args.download_workers)
     print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    train_tokenizer(profile)
     print()
     print("Done! Ready to train.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
